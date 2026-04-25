@@ -7,7 +7,7 @@ import process from "node:process";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
-const DEFAULT_MODEL = "gpt-5.5";
+const DEFAULT_MODEL = "gpt-5.4-mini";
 const DEFAULT_OPENCLAW_AGENT_ID = "main";
 const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 const PACKAGE_VERSION = "0.2.6";
@@ -508,13 +508,62 @@ function authPathCandidates() {
     ? path.join(resolvePathFromCwd(process.env.CODEX_HOME.trim()), "auth.json")
     : null;
 
+  // 9Router integration: extract codex accounts from db.json
+  let nineRouterCandidates = [];
+  try {
+    const dbPath = path.join(os.homedir(), "AppData", "Roaming", "9router", "db.json");
+    if (fsSync.existsSync(dbPath)) {
+      const db = JSON.parse(fsSync.readFileSync(dbPath, "utf-8"));
+      const connections = db.providerConnections || [];
+      const codexAccounts = connections.filter(
+        c => c.provider === "codex" && c.isActive && c.accessToken && c.refreshToken
+      );
+
+      // Write temporary auth files for each 9Router account
+      const tmpDir = path.join(os.tmpdir(), "codex-imagen-9router");
+      if (!fsSync.existsSync(tmpDir)) {
+        fsSync.mkdirSync(tmpDir, { recursive: true });
+      }
+
+      for (const acct of codexAccounts) {
+        // Decode account_id from JWT access token
+        let accountId = null;
+        try {
+          const payload = JSON.parse(Buffer.from(acct.accessToken.split(".")[1], "base64url").toString());
+          accountId = payload["https://api.openai.com/auth"]?.chatgpt_account_id ?? null;
+        } catch (_) {}
+
+        const authData = {
+          access_token: acct.accessToken,
+          refresh_token: acct.refreshToken,
+          id_token: acct.idToken || null,
+          account_id: accountId,
+          email: acct.email,
+          expired: acct.expiresAt || null,
+          last_refresh: acct.updatedAt || null,
+          type: "codex",
+        };
+
+        const safeName = (acct.email || "unknown").replace(/[^a-zA-Z0-9@._-]/g, "_");
+        const filePath = path.join(tmpDir, `9router-${safeName}.json`);
+        fsSync.writeFileSync(filePath, JSON.stringify(authData, null, 2));
+        nineRouterCandidates.push(filePath);
+      }
+    }
+  } catch (e) {
+    // Ignore errors reading 9Router db
+  }
+
+  // Random shuffle to distribute load across accounts
+  nineRouterCandidates.sort(() => Math.random() - 0.5);
+
   return uniq([
     ...envCandidates,
+    ...nineRouterCandidates,
     path.join(resolveOpenClawAgentDir(), "auth-profiles.json"),
     path.join(resolveOpenClawAgentDir(), "auth.json"),
     path.join(resolveOpenClawOAuthDir(), "oauth.json"),
     codexHome,
-    DEFAULT_CODEX_AUTH_PATH,
   ]);
 }
 
@@ -1004,6 +1053,24 @@ function parseAuthJson(auth, authPath, options = {}) {
     });
   }
 
+  // ProxyPal json support
+  if (auth.access_token && auth.refresh_token && auth.account_id) {
+    return buildAuthResult({
+      authJson: auth,
+      authPath,
+      authFormat: "proxypal-json",
+      authMode: "chatgpt",
+      lastRefresh: auth.last_refresh ?? null,
+      profile: {
+        access: auth.access_token,
+        refresh: auth.refresh_token,
+        accountId: auth.account_id,
+        email: auth.email,
+        expires: auth.expired,
+      },
+    });
+  }
+
   if (auth.profiles && typeof auth.profiles === "object") {
     const { profileId, profile } = selectOpenClawProfile(auth, authPath, options);
     return buildAuthResult({
@@ -1431,6 +1498,25 @@ function applyRefreshTokensToProfile(profile, refreshResponse) {
 function mergeRefreshResponseForAuth(currentAuth, refreshResponse) {
   if (currentAuth.authFormat === "codex-auth-json") {
     return mergeRefreshResponse(currentAuth.authJson, refreshResponse);
+  }
+
+  if (currentAuth.authFormat === "proxypal-json") {
+    const nextAuthJson = structuredClone(currentAuth.authJson);
+    if (refreshResponse.access_token) {
+      nextAuthJson.access_token = refreshResponse.access_token;
+    }
+    if (refreshResponse.refresh_token) {
+      nextAuthJson.refresh_token = refreshResponse.refresh_token;
+    }
+    if (refreshResponse.id_token) {
+      nextAuthJson.id_token = refreshResponse.id_token;
+    }
+    const expires = refreshedExpiresMs(refreshResponse);
+    if (expires) {
+      nextAuthJson.expired = new Date(expires).toISOString();
+    }
+    nextAuthJson.last_refresh = new Date().toISOString();
+    return nextAuthJson;
   }
 
   const nextAuthJson = structuredClone(currentAuth.authJson);
