@@ -13,3 +13,6 @@ out/
 generated/
 *.log
 codex-imagen*.jsonl
+
+# Local AI context (session state — not for version control)
+.brain/

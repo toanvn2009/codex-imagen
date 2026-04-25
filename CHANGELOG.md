@@ -4,6 +4,23 @@ All notable changes to `codex-imagen` are recorded here.
 
 ## Unreleased
 
+## [0.2.6] - 2026-04-25
+
+### Changed
+
+- Changed default model from `gpt-5.4` to `gpt-5.5`.
+
+### Refactored
+
+- Added named constants for magic numbers: `PROFILE_LAST_GOOD_SCORE`, `PROFILE_ORDER_SCORE_BASE`, `PROFILE_DEFAULT_SCORE`, `PROFILE_IDENTITY_SCORE`, `LAST_REFRESH_STALE_MS`, `HTTP_BODY_PREVIEW_MAX_CHARS`.
+- Moved `HttpStatusError` class declaration to top of file alongside other error classes (was declared after first use).
+- Extracted `applyRefreshTokensToProfile()` helper to remove duplicated token-update logic in `mergeRefreshResponseForAuth`.
+- Extracted `processSseBlock()` helper to deduplicate SSE block parsing between the stream loop and tail buffer handler; reduced `parseStreamingResponse` from ~104 to ~70 lines.
+
+### Added
+
+- Added skill references: `skills/nodejs-best-practices`, `skills/javascript-testing-patterns`, `skills/error-handling-patterns`.
+
 ## [0.2.5] - 2026-04-23
 
 ### Fixed

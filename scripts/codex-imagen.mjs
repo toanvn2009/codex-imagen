@@ -30,6 +30,10 @@ const PROFILE_IDENTITY_SCORE = 100;
 const LAST_REFRESH_STALE_MS = 8 * 24 * 60 * 60 * 1000;
 // Max chars of HTTP error body shown in error message
 const HTTP_BODY_PREVIEW_MAX_CHARS = 4_000;
+// Auto-downgrade image detail to 'low' when base64 reference exceeds this size
+const AUTO_DOWNGRADE_DETAIL_BYTES = 5 * 1024 * 1024;
+// Suggest JPEG conversion when PNG reference exceeds this raw byte size
+const JPEG_SUGGESTION_BYTES = 2 * 1024 * 1024;
 const FILE_LOCK_TIMEOUT_ERROR_CODE = "file_lock_timeout";
 const AUTH_STORE_LOCK_OPTIONS = {
   retries: {
@@ -1132,6 +1136,14 @@ async function localImageToInputImage(imagePath, options) {
     throw new Error(`Unsupported image format for ${absolutePath}. Supported: PNG, JPEG, GIF, WebP.`);
   }
 
+  // Suggest JPEG for large PNG references (JPEG is typically 5-10x smaller)
+  if (mime === "image/png" && bytes.length > JPEG_SUGGESTION_BYTES) {
+    logProgress(
+      options,
+      `codex-imagen: tip: ${path.basename(absolutePath)} is a ${(bytes.length / 1024 / 1024).toFixed(1)}MB PNG. Convert to JPEG for faster upload.`
+    );
+  }
+
   const imageUrl = `data:${mime};base64,${bytes.toString("base64")}`;
   if (imageUrl.length > LARGE_DATA_URL_WARNING_BYTES) {
     logProgress(
@@ -1196,6 +1208,15 @@ async function buildPromptContent(options, prompt) {
   content.push({ type: "input_text", text: prompt });
 
   if (refs.length > 0) {
+    // Auto-downgrade detail when total reference data is very large
+    const totalDataUrlBytes = refs.reduce((sum, ref) => sum + (ref.metadata.data_url_bytes ?? 0), 0);
+    if (totalDataUrlBytes > AUTO_DOWNGRADE_DETAIL_BYTES && options.imageDetail === "high") {
+      options.imageDetail = "low";
+      logProgress(
+        options,
+        `codex-imagen: auto-downgraded image detail to 'low' (${(totalDataUrlBytes / 1024 / 1024).toFixed(1)}MB total reference data). Use --image-detail high to override.`
+      );
+    }
     logProgress(options, `codex-imagen: attached ${refs.length} reference image(s)`);
     refs.forEach((ref, index) => {
       const source = ref.metadata.path ?? ref.metadata.url ?? "image";
@@ -2334,6 +2355,7 @@ async function requestImage(options, prompt, auth) {
       headers: buildHeaders(auth, requestId, sessionId),
       body: JSON.stringify(body),
       signal: abortController.signal,
+      keepalive: true,
     });
 
     if (!response.ok) {
