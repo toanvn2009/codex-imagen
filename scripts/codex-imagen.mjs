@@ -7,7 +7,7 @@ import process from "node:process";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
-const DEFAULT_MODEL = "gpt-5.4";
+const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_OPENCLAW_AGENT_ID = "main";
 const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 const PACKAGE_VERSION = "0.2.6";
@@ -21,6 +21,15 @@ const MAX_RETRIES = 100;
 const RETRY_BASE_DELAY_MS = 200;
 const DEFAULT_IMAGE_DETAIL = "high";
 const LARGE_DATA_URL_WARNING_BYTES = 15 * 1024 * 1024;
+// Profile scoring weights used in selectOpenClawProfile to rank auth candidates
+const PROFILE_LAST_GOOD_SCORE = 1_000_000;
+const PROFILE_ORDER_SCORE_BASE = 500_000;
+const PROFILE_DEFAULT_SCORE = 1_000;
+const PROFILE_IDENTITY_SCORE = 100;
+// Threshold: re-refresh if last_refresh is older than this
+const LAST_REFRESH_STALE_MS = 8 * 24 * 60 * 60 * 1000;
+// Max chars of HTTP error body shown in error message
+const HTTP_BODY_PREVIEW_MAX_CHARS = 4_000;
 const FILE_LOCK_TIMEOUT_ERROR_CODE = "file_lock_timeout";
 const AUTH_STORE_LOCK_OPTIONS = {
   retries: {
@@ -64,6 +73,16 @@ class GenerationFailedError extends Error {
     this.name = "GenerationFailedError";
     this.backendErrors = backendErrors;
     this.seenEventTypes = seenEventTypes;
+  }
+}
+
+class HttpStatusError extends Error {
+  constructor(status, statusText, body) {
+    super(`HTTP ${status} ${statusText}\n${body}`);
+    this.name = "HttpStatusError";
+    this.status = status;
+    this.statusText = statusText;
+    this.body = body;
   }
 }
 
@@ -837,24 +856,24 @@ function scoreOpenClawProfile(profileId, profile, state, configuredOrder = []) {
   let score = 0;
   const configuredIndex = configuredOrder.indexOf(profileId);
   if (configuredIndex !== -1) {
-    score += 500_000 - configuredIndex;
+    score += PROFILE_ORDER_SCORE_BASE - configuredIndex;
   }
   const lastGood = state?.lastGood?.["openai-codex"];
   if (lastGood && profileId === lastGood) {
-    score += 1_000_000;
+    score += PROFILE_LAST_GOOD_SCORE;
   }
   if (profileId === "openai-codex:default") {
-    score += 1000;
+    score += PROFILE_DEFAULT_SCORE;
   }
   const expiresMs = normalizeExpiresMs(profile.expires);
   if (expiresMs) {
     score += Math.min(999_999, Math.max(0, Math.floor((expiresMs - Date.now()) / 1000)));
   }
   if (profile.email) {
-    score += 100;
+    score += PROFILE_IDENTITY_SCORE;
   }
   if (profileAccountId(profile)) {
-    score += 100;
+    score += PROFILE_IDENTITY_SCORE;
   }
   return score;
 }
@@ -1034,8 +1053,7 @@ function staleRefreshReason(auth, options) {
     return null;
   }
 
-  const eightDaysMs = 8 * 24 * 60 * 60 * 1000;
-  if (lastRefreshMs < Date.now() - eightDaysMs) {
+  if (lastRefreshMs < Date.now() - LAST_REFRESH_STALE_MS) {
     return "last_refresh is older than 8 days";
   }
 
@@ -1370,40 +1388,10 @@ function refreshedExpiresMs(refreshResponse) {
   return payload?.exp ? payload.exp * 1000 : null;
 }
 
-function mergeRefreshResponseForAuth(currentAuth, refreshResponse) {
-  if (currentAuth.authFormat === "codex-auth-json") {
-    return mergeRefreshResponse(currentAuth.authJson, refreshResponse);
-  }
-
-  const nextAuthJson = structuredClone(currentAuth.authJson);
-  const profileId = currentAuth.profileId;
-
-  if (currentAuth.authFormat === "openclaw-auth-profiles") {
-    const profile = nextAuthJson.profiles?.[profileId];
-    if (!profile) {
-      throw new Error(`OpenClaw profile disappeared during refresh: ${profileId}`);
-    }
-    if (refreshResponse.access_token) {
-      profile.access = refreshResponse.access_token;
-    }
-    if (refreshResponse.refresh_token) {
-      profile.refresh = refreshResponse.refresh_token;
-    }
-    const expires = refreshedExpiresMs(refreshResponse);
-    if (expires) {
-      profile.expires = expires;
-    }
-    if (refreshResponse.id_token) {
-      profile.idToken = refreshResponse.id_token;
-    }
-    return nextAuthJson;
-  }
-
-  const provider = profileId?.includes(":") ? profileId.split(":")[0] : "openai-codex";
-  const profile = nextAuthJson[provider];
-  if (!profile) {
-    throw new Error(`OpenClaw OAuth entry disappeared during refresh: ${provider}`);
-  }
+/**
+ * Applies refresh response tokens onto an OpenClaw profile object in-place.
+ */
+function applyRefreshTokensToProfile(profile, refreshResponse) {
   if (refreshResponse.access_token) {
     profile.access = refreshResponse.access_token;
   }
@@ -1417,6 +1405,31 @@ function mergeRefreshResponseForAuth(currentAuth, refreshResponse) {
   if (refreshResponse.id_token) {
     profile.idToken = refreshResponse.id_token;
   }
+}
+
+function mergeRefreshResponseForAuth(currentAuth, refreshResponse) {
+  if (currentAuth.authFormat === "codex-auth-json") {
+    return mergeRefreshResponse(currentAuth.authJson, refreshResponse);
+  }
+
+  const nextAuthJson = structuredClone(currentAuth.authJson);
+  const profileId = currentAuth.profileId;
+
+  if (currentAuth.authFormat === "openclaw-auth-profiles") {
+    const profile = nextAuthJson.profiles?.[profileId];
+    if (!profile) {
+      throw new Error(`OpenClaw profile disappeared during refresh: ${profileId}`);
+    }
+    applyRefreshTokensToProfile(profile, refreshResponse);
+    return nextAuthJson;
+  }
+
+  const provider = profileId?.includes(":") ? profileId.split(":")[0] : "openai-codex";
+  const profile = nextAuthJson[provider];
+  if (!profile) {
+    throw new Error(`OpenClaw OAuth entry disappeared during refresh: ${provider}`);
+  }
+  applyRefreshTokensToProfile(profile, refreshResponse);
   return nextAuthJson;
 }
 
@@ -2023,6 +2036,35 @@ function formatBackendErrors(errors) {
   return dedupeBackendErrors(errors).map((error) => `  - ${formatBackendError(error)}`).join("\n");
 }
 
+/**
+ * Parse and process one SSE event block. Updates seenEventTypes, backendErrors,
+ * and calls recordImageCall for any image generation calls found.
+ */
+async function processSseBlock(block, options, seenEventTypes, backendErrors, noteProgress, recordImageCall) {
+  const sse = parseSseEvent(block);
+  if (!sse.data || sse.data === "[DONE]") {
+    return;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(sse.data);
+  } catch {
+    seenEventTypes.add(`unparsed:${sse.type}`);
+    return;
+  }
+
+  const payloadType = eventTypeFromPayload(payload);
+  seenEventTypes.add(payloadType);
+  logVerbose(options, `event: ${payloadType}`);
+  noteProgress(payloadType);
+  backendErrors.push(...backendErrorsFromPayload(payload, payloadType));
+
+  for (const call of imageCallsFromPayload(payload, payloadType)) {
+    await recordImageCall(call);
+  }
+}
+
 async function parseStreamingResponse(response, options, onImageCall, streamState = {}) {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -2072,29 +2114,7 @@ async function parseStreamingResponse(response, options, onImageCall, streamStat
 
       const block = buffer.slice(0, match.index);
       buffer = buffer.slice(match.index + match[0].length);
-      const sse = parseSseEvent(block);
-
-      if (!sse.data || sse.data === "[DONE]") {
-        continue;
-      }
-
-      let payload;
-      try {
-        payload = JSON.parse(sse.data);
-      } catch {
-        seenEventTypes.add(`unparsed:${sse.type}`);
-        continue;
-      }
-
-      const payloadType = eventTypeFromPayload(payload);
-      seenEventTypes.add(payloadType);
-      logVerbose(options, `event: ${payloadType}`);
-      noteProgress(payloadType);
-      backendErrors.push(...backendErrorsFromPayload(payload, payloadType));
-
-      for (const call of imageCallsFromPayload(payload, payloadType)) {
-        await recordImageCall(call);
-      }
+      await processSseBlock(block, options, seenEventTypes, backendErrors, noteProgress, recordImageCall);
     }
   }
 
@@ -2104,22 +2124,7 @@ async function parseStreamingResponse(response, options, onImageCall, streamStat
   }
 
   if (buffer.trim()) {
-    const sse = parseSseEvent(buffer.trim());
-    if (sse.data && sse.data !== "[DONE]") {
-      try {
-        const payload = JSON.parse(sse.data);
-        const payloadType = eventTypeFromPayload(payload);
-        seenEventTypes.add(payloadType);
-        logVerbose(options, `event: ${payloadType}`);
-        noteProgress(payloadType);
-        backendErrors.push(...backendErrorsFromPayload(payload, payloadType));
-        for (const call of imageCallsFromPayload(payload, payloadType)) {
-          await recordImageCall(call);
-        }
-      } catch {
-        seenEventTypes.add(`unparsed:${sse.type}`);
-      }
-    }
+    await processSseBlock(buffer.trim(), options, seenEventTypes, backendErrors, noteProgress, recordImageCall);
   }
 
   return {
@@ -2333,7 +2338,7 @@ async function requestImage(options, prompt, auth) {
 
     if (!response.ok) {
       const text = await response.text();
-      const preview = text.length > 4000 ? `${text.slice(0, 4000)}...` : text;
+      const preview = text.length > HTTP_BODY_PREVIEW_MAX_CHARS ? `${text.slice(0, HTTP_BODY_PREVIEW_MAX_CHARS)}...` : text;
       throw new HttpStatusError(response.status, response.statusText, preview);
     }
 
@@ -2437,15 +2442,7 @@ async function saveImageCallsAtEnd(options, imageCalls) {
   );
 }
 
-class HttpStatusError extends Error {
-  constructor(status, statusText, body) {
-    super(`HTTP ${status} ${statusText}\n${body}`);
-    this.name = "HttpStatusError";
-    this.status = status;
-    this.statusText = statusText;
-    this.body = body;
-  }
-}
+
 
 function authSummary(auth, options) {
   return {
